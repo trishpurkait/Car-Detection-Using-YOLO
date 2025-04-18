@@ -1,0 +1,116 @@
+import cv2
+import torch
+import numpy as np
+from shapely.geometry import Polygon
+import time
+
+total_slots = 5
+prev_status = 5
+
+model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
+
+video_source = (0)
+dw = 640
+dh = 480
+
+parking_slots = [
+    np.array([[179, 171], [107, 260], [9, 215], [70, 136]], dtype=np.int32).reshape((-1, 1, 2)),
+    np.array([[173, 165], [110, 258], [220, 298], [264, 194]], dtype=np.int32).reshape((-1, 1, 2)),
+    np.array([[274, 196], [227, 299], [342, 337], [377, 225]], dtype=np.int32).reshape((-1, 1, 2)),
+    np.array([[382, 225], [346, 339], [483, 384], [505, 258]], dtype=np.int32).reshape((-1, 1, 2)),
+    np.array([[508, 261], [487, 388], [633, 436], [630, 288]], dtype=np.int32).reshape((-1, 1, 2))
+]
+
+def preprocess_image(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    median_blurred = cv2.medianBlur(blurred, 5)
+    thresholded = cv2.adaptiveThreshold(median_blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                        cv2.THRESH_BINARY, 11, 2)
+    dilated = cv2.dilate(thresholded, np.ones((3, 3), np.uint8), iterations=1)
+    return dilated
+
+def count_edges_in_polygon(image, polygon):
+    processed_image = preprocess_image(image)
+    mask = np.zeros(image.shape[:2], dtype=np.uint8)
+    cv2.fillPoly(mask, [polygon], 255)
+    masked_image = cv2.bitwise_and(processed_image, processed_image, mask=mask)
+    return np.sum(masked_image > 0)
+
+def intersection_area(polygon1, polygon2):
+    intersection = polygon1.intersection(polygon2)
+    return intersection.area
+
+def process_frame(frame):
+    if frame is None:
+        return None, []
+
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = model(frame_rgb)
+    detections = results.xyxy[0].numpy()
+
+    slot_statusess = []
+    slot_statuses = 0
+
+    for i, slot in enumerate(parking_slots):
+        slot_polygon = Polygon([tuple(pt[0]) for pt in slot])
+        slot_status = "Empty"
+
+        for det in detections:
+            x1, y1, x2, y2, conf, cls = det
+            if cls == 2:
+                bbox_poly = Polygon([(x1, y1), (x2, y1), (x2, y2), (x1, y2)])
+
+                if slot_polygon.intersects(bbox_poly):
+                    inter_area = intersection_area(bbox_poly, slot_polygon)
+                    edges_count = count_edges_in_polygon(frame, slot)
+                    if not (inter_area < 0.2 * slot_polygon.area and edges_count > 1749.5):
+                        slot_status = "Filled"
+                        slot_statuses += 1
+                        break
+
+        slot_statusess.append(f"Slot {i + 1}: {slot_status}")
+        color = (0, 255, 0) if slot_status == "Empty" else (0, 0, 255)
+        cv2.polylines(frame, [slot], isClosed=True, color=color, thickness=2)
+
+    return frame, slot_statusess
+
+cap = cv2.VideoCapture(video_source)
+
+def mouse_callback(event, x, y, flags, param):
+    if event == cv2.EVENT_MOUSEMOVE:
+        print(f"Coordinates: x={x}, y={y}")
+
+cv2.namedWindow('Parking Lot Monitoring')
+cv2.setMouseCallback('Parking Lot Monitoring', mouse_callback)
+
+last_detection_time = time.time()
+ret, frame = cap.read()
+
+if ret:
+    processed_frame, slot_statuses = process_frame(frame)
+    print(slot_statuses)
+    prev_status = slot_statuses
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+    frame = cv2.resize(frame, (dw, dh))
+    current_time = time.time()
+
+    if current_time - last_detection_time >= 3:
+        processed_frame, slot_statuses = process_frame(frame)
+        last_detection_time = current_time
+        print(slot_statuses)
+        if prev_status != slot_statuses:
+            print("Status changed:", slot_statuses)
+            prev_status = slot_statuses
+
+    cv2.imshow('Parking Lot Monitoring', processed_frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
